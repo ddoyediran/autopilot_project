@@ -1,7 +1,7 @@
 # Autopilot Project
 
 ## Overview
-This project implements an AI-powered autopilot system for autonomous vehicles, featuring data collection, model training, and real-time inference. It includes tools for processing driving data, training world models, and running both simulated and real-time control loops using deep learning models.
+This project implements an AI-powered autopilot End-to-End ML system for autonomous vehicles, featuring data collection, model training, and real-time inference. It includes tools for processing driving data, training world models, and running both simulated and real-time control loops using deep learning models.
 
 ## Features
 - **Data Processing:** Extracts images and steering data from ROS2 bag files for training.
