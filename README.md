@@ -42,6 +42,8 @@ This project implements an AI-powered autopilot End-to-End ML system for autonom
 	  python process_data.py
 	  ```
 	- Output: `training_images/` and `driving_log.csv`
+    
+    Note: If you need access to the dataset, feel free to reach out (LinkedIn or Twitter/X). I can't upload to github because of the size.  
 
 3. **Train Models:**
 	- Use your preferred training pipeline to train VAE encoder/decoder, RNN, and controller models.
