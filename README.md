@@ -25,7 +25,7 @@ This project implements an AI-powered autopilot End-to-End ML system for autonom
 
 ## Main Components
 - **process_data.py:** Extracts images and steering labels from ROS2 bag files and saves them for training.
-- **dream_racer.py:** Simulates the world model, visualizes predictions, and allows manual/autopilot control.
+- **dream_racer.py:** Simulates the world model, visualizes predictions, and allows manual/autopilot control (you can use this file to test in simulation - since you might not have access to the physical robot).
 - **autopilot_wm.py:** ROS2 node for real-time inference and control using TensorFlow Lite models.
 
 ## Setup
