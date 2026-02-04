@@ -46,6 +46,7 @@ This project implements an AI-powered autopilot system for autonomous vehicles, 
 3. **Train Models:**
 	- Use your preferred training pipeline to train VAE encoder/decoder, RNN, and controller models.
 	- Save models as `.keras` and convert to `.tflite` for deployment.
+    - You can download all models from the releases here on Github. 
 
 4. **Run Dream Racer Simulation:**
 	```bash
