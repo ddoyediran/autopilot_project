@@ -1,0 +1,5 @@
+opencv-python==4.13.0.90
+numpy==2.0.2
+pandas==2.3.3
+rosbags==0.9.23
+tensorflow==2.20.0 
