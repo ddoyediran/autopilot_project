@@ -3,15 +3,20 @@ import numpy as np
 import cv2
 import os
 import random
+import datetime
 from tensorflow.keras import layers
 
 # --- CONFIGURATION ---
 IMG_HEIGHT = 80
 IMG_WIDTH = 160
+# Display Resolution (Upscaled)
+DISP_W = 640
+DISP_H = 320
+
 CROP_TOP = 40
 CROP_BOTTOM = 60
 LATENT_DIM = 32
-FPS = 30  # Simulation speed
+FPS = 30 
 
 # --- LOAD MODELS ---
 @tf.keras.utils.register_keras_serializable()
@@ -50,39 +55,40 @@ def get_random_real_z():
     z_out = encoder(np.expand_dims(img_norm, axis=0))
     return z_out[0]
 
-def draw_hud(frame, steer, autopilot_steer, mode, frame_count, paused):
-    # 1. Steering Bar
-    bar_width = 200
-    bar_height = 20
+def draw_hud(frame, steer, autopilot_steer, mode, frame_count, paused, recording):
     center_x = frame.shape[1] // 2
     bar_y = frame.shape[0] - 40
+    bar_height = 20
     
-    # Background
+    # 1. Steering Bar
     cv2.rectangle(frame, (center_x - 100, bar_y), (center_x + 100, bar_y + bar_height), (50, 50, 50), -1)
     cv2.line(frame, (center_x, bar_y), (center_x, bar_y + bar_height), (255, 255, 255), 1)
     
-    # Actual Steering (Red Left / Green Right)
+    # Actual Steering
     steer_len = int(steer * 100)
     if steer_len < 0:
         cv2.rectangle(frame, (center_x + steer_len, bar_y + 2), (center_x, bar_y + bar_height - 2), (0, 0, 255), -1)
     else:
         cv2.rectangle(frame, (center_x, bar_y + 2), (center_x + steer_len, bar_y + bar_height - 2), (0, 255, 0), -1)
 
-    # Ghost Dot (Blue)
+    # Ghost Dot
     ai_x = int(center_x + (autopilot_steer * 100))
     cv2.circle(frame, (ai_x, bar_y + 10), 5, (255, 255, 0), -1)
 
     # 2. Text Info
-    # Timer
     seconds = frame_count / FPS
     cv2.putText(frame, f"TIME: {seconds:.1f}s", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    # Mode
     cv2.putText(frame, f"MODE: {mode}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
-    # Pause Overlay
+    # 3. Status Overlays
     if paused:
         cv2.putText(frame, "PAUSED", (center_x - 60, frame.shape[0]//2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        
+    if recording:
+        # Blinking Red Dot
+        if (frame_count // 15) % 2 == 0: # Blink every half second
+            cv2.circle(frame, (frame.shape[1] - 30, 30), 10, (0, 0, 255), -1)
+        cv2.putText(frame, "REC", (frame.shape[1] - 65, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     return frame
 
@@ -90,40 +96,74 @@ def draw_hud(frame, steer, autopilot_steer, mode, frame_count, paused):
 z_current = get_random_real_z()
 autopilot_mode = False
 paused = False
+recording = False
+video_out = None
 current_steering = 0.0
 frame_count = 0
 
 print("--- CONTROLS ---")
 print(" [A] Toggle Autopilot")
-print(" [Space/P] Pause/Play")
-print(" [M] Manual Mode")
-print(" [J / L] Steer Left / Right")
-print(" [R] RESET")
+print(" [V] Toggle RECORDING")
+print(" [Space] Pause")
+print(" [R] Reset")
 print(" [Q] Quit")
 
 while True:
-    # 1. DECODE VISUALS (Always do this so we see the pause frame)
+    # 1. DECODE VISUALS
     reconstruction = decoder(z_current)
     frame = (np.array(reconstruction)[0] * 255).astype(np.uint8)
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     
-    # 2. GET AI OPINION
+    # 2. UPSCALING
+    big_frame = cv2.resize(frame, (DISP_W, DISP_H), interpolation=cv2.INTER_NEAREST)
+    
+    # 3. GET AI OPINION
     ai_pred = controller(z_current)
     ai_steer = float(ai_pred[0][0])
     
-    # 3. DRAW HUD
-    mode_str = "AUTOPILOT" if autopilot_mode else "MANUAL"
-    big_frame = cv2.resize(frame, (640, 320), interpolation=cv2.INTER_NEAREST)
-    final_frame = draw_hud(big_frame, current_steering, ai_steer, mode_str, frame_count, paused)
-    cv2.imshow("Dream Racer v3", final_frame)
+    # 4. DETERMINE ACTION
+    if autopilot_mode:
+        current_steering = ai_steer
+        mode_str = "AUTOPILOT"
+    else:
+        mode_str = "MANUAL"
+        current_steering *= 0.8 # Decay
+        if abs(current_steering) < 0.05: current_steering = 0.0
+
+    # 5. DRAW HUD
+    final_frame = draw_hud(big_frame.copy(), current_steering, ai_steer, mode_str, frame_count, paused, recording)
     
-    # 4. INPUT HANDLING
-    key = cv2.waitKey(int(1000/FPS)) # Wait depending on FPS
+    # 6. VIDEO RECORDING
+    if recording:
+        if video_out is None:
+            # Init Video Writer
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"dream_run_{timestamp}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Mac compatible
+            video_out = cv2.VideoWriter(filename, fourcc, float(FPS), (DISP_W, DISP_H))
+            print(f"\n[REC] Started: {filename}")
+        
+        video_out.write(final_frame)
+
+    cv2.imshow("Dream Racer v4", final_frame)
+    
+    # 7. INPUT HANDLING
+    key = cv2.waitKey(int(1000/FPS))
     
     if key == ord('q'): break
     if key == ord('a'): autopilot_mode = True
     if key == ord('m'): autopilot_mode = False
     if key == ord(' ') or key == ord('p'): paused = not paused
+    
+    # VIDEO TOGGLE
+    if key == ord('v'):
+        if recording:
+            recording = False
+            video_out.release()
+            video_out = None
+            print("[REC] Stopped and Saved.")
+        else:
+            recording = True
     
     if key == ord('r'): 
         print("Resetting...")
@@ -131,24 +171,16 @@ while True:
         frame_count = 0
         continue
 
-    # --- IF PAUSED, SKIP PHYSICS ---
-    if paused:
-        continue
+    if paused: continue
 
-    # 5. DETERMINE ACTION
-    if autopilot_mode:
-        current_steering = ai_steer
-    else:
-        # Manual Input decay
-        current_steering *= 0.8
-        if abs(current_steering) < 0.05: current_steering = 0.0
-        
+    # Manual Keys
+    if not autopilot_mode:
         if key == ord('j'): current_steering = -0.8
         if key == ord('l'): current_steering = 0.8
         if key == 2: current_steering = -0.8
         if key == 3: current_steering = 0.8
 
-    # 6. PHYSICS (World Model Step)
+    # 8. PHYSICS
     rnn_z = tf.expand_dims(z_current, axis=1)
     rnn_action = tf.constant([[[current_steering]]], dtype=tf.float32)
     
@@ -156,4 +188,7 @@ while True:
     z_current = tf.squeeze(z_next, axis=1)
     frame_count += 1
 
+# Cleanup
+if video_out is not None:
+    video_out.release()
 cv2.destroyAllWindows()
