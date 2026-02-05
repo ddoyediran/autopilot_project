@@ -11,11 +11,11 @@ This project implements an AI-powered autopilot End-to-End ML system for autonom
 - **Flight Recorder:** Logs inference and control data for analysis.
 
 ## Architecture (World Model)
-Instead of a standard Convolutional Neural Network (CNN) that connects pixels directly to steering, I used a World Model approach by splitting the brain into parts: **Vision** and **Control**
+Instead of a standard Convolutional Neural Network (CNN) that connects pixels directly to steering, A World Model approach is used by splitting the brain into parts: **Vision** and **Control**
 
 ### 1. Vision System (Variational Autoencoder, VAE)
 The robot's camera captures 12,800 pixels (dots) every frame. Most of this is useless noise (the texture of the wood floor, the shadow of the table, the color of the wall).
-The VAE is like a compression engine. It learns to ignore the noise and summarize the entire image into just **32 numbers**. These 32 numbers represent the "Essence" of the road (e.g., "Road curves left," "Road is straight").
+The VAE learns to ignore the noise, extract main signal (geometry) and summarize the entire image into just **32 numbers**. These 32 numbers represent the "Essence" of the road (e.g., "Road curves left," "Road is straight").
 
 Trained a Convolutional Encoder to map the input image $(160 \times 80 \times 3)$ to a **Latent Vector $z$** $(1 \times 32)$. This forces the model to learn a disentangled representation of the environment, filtering out high-frequency noise and focusing on geometry.
 
@@ -39,7 +39,7 @@ This validated that our Latent Space $z$ captured sufficient temporal and spatia
 ### Applying Smoothing and Dynamic Braking
 *   **Quantization:** Converted the models to `.tflite` for edge inference (Raspberry PI 5).
 *   **Inference Speed:** Achieved ~4ms latency per frame.
-*   **Control Theory:** We implemented a non-linear steering gain ($y = x^{0.85}$) to increase sensitivity in turns, and a deadzone to prevent oscillation on straights.
+*   **Control Theory:** Implemented a non-linear steering gain ($y = x^{0.85}$) to increase sensitivity in turns, and a deadzone to prevent oscillation on straights.
 
 
 ## Directory Structure
