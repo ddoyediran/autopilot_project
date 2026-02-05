@@ -32,7 +32,16 @@ Simply put: It is like asking the AI: *"If you are here, and you steer left, wha
 
 The output: The AI successfully generated a video from scratch (hallucinating the future) showing the track moving correctly. This proved the AI understood the physics of driving.
 
+<details>
+	<summary>Dream Run Demo (Click to play/pause)</summary>
+	<video src="assets/dream_run_20260205_151545.mp4" controls width="640" height="360">
+		Your browser does not support the video tag.
+	</video>
+</details>
+
 This validated that our Latent Space $z$ captured sufficient temporal and spatial information to reconstruct the car's dynamics.
+
+
 
 ### 4. Reasoning and Reacting to Objects (to be added) 
 
