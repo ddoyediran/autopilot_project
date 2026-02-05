@@ -73,7 +73,7 @@ class WorldModelPilot(Node):
         self.servo_pub = self.create_publisher(SetPWMServoState, '/ros_robot_controller/pwm_servo/set_state', 10)
         self.debug_pub = self.create_publisher(Image, '/autopilot/debug', 10)
 
-        # Handle Ctrl+C correctly
+        # Handle Ctrl+C correctly - Graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def signal_handler(self, sig, frame):
@@ -83,6 +83,24 @@ class WorldModelPilot(Node):
         sys.exit(0)
 
     def img_callback(self, msg):
+        """
+        Processes incoming camera frames through a two-stage deep learning pipeline:
+        1) VAE encoder extracts a compact latent representation (z-vector) capturing road geometry
+        2) Controller network predicts steering command from the latent representation
+
+        The predicted steering command is passed to the actuation system with dynamic speed control, telemetry logging, and real-time HUD visualization
+
+        Args:
+            msg (sensor_msgs.msg.Image): ROS image message from vehicle's forward-facing camera.
+            Expected encoding: "bgr8" (handled by cv_bridge conversion)
+
+        Side Effects:
+            - Publishes steering commands to servo controller (PWM) via drive_robot()
+            - Publishes velocity commands via Twist message via drive_robot()
+            - Appends inference telemetry to internal log buffer (latency, predictions)
+            - Publishes annotated debug image with steering HUD overlay via drive_robot()
+            - Updates internal state (self.last_steering) for smoothing continuity
+        """
         try:
             cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             if cv_img.shape[0] > (CROP_TOP + CROP_BOTTOM):
@@ -96,10 +114,12 @@ class WorldModelPilot(Node):
 
             t0 = time.perf_counter()
             
+            # VAE Model inference: take raw pixel (extract signal - road geometric) output latent vector (z)
             self.enc_interp.set_tensor(self.enc_in, input_data)
             self.enc_interp.invoke()
-            z_vector = self.enc_interp.get_tensor(self.enc_out) 
+            z_vector = self.enc_interp.get_tensor(self.enc_out) # latent vector z[32]
 
+            # Controller Model - takes the latent vector predict the control (steer)
             self.ctrl_interp.set_tensor(self.ctrl_in, z_vector)
             self.ctrl_interp.invoke()
             raw_pred = self.ctrl_interp.get_tensor(self.ctrl_out)[0][0]
@@ -112,7 +132,23 @@ class WorldModelPilot(Node):
         except Exception as e:
             self.get_logger().error(f"Loop Error: {e}")
 
-    def drive_robot(self, raw_pred, inf_ms, debug_img):
+    def drive_robot(self, raw_pred: float, inf_ms: float, debug_img):
+        """
+        Executes end-to-end steering and speed control for the autonomous robot.
+        Processes a raw neural network steering prediction through a production-ready
+        control pipeline: applies deadzone filtering, exponential smoothing, PWM actuation
+        conversion, and dynamic speed adjustment based on turn severity
+        
+        raw_pred (float): Raw normalized steering prediction from inference model. Expected range: [-1.0, 1.0]
+        inf_ms (float): Inference latency in milliseconds (for performance logging)
+        debug_img (np.ndarray): Current camera frame (BGR) for real-time HUD visualization
+
+        Effects:
+            - Publishes PWM command to servo controller via ROS topic (self.servo_pub)
+            - Publishes linear velocity via Twist message (self.vel_pub)
+            - Appends telemetry record to internal log buffer (timestamp, inference time, raw/smoothed steering, PWM target, target speed)
+            - Publishes annotated HUD image showing raw vs. smoothed steering commands via self.publish_hud() for real-time debugging in Foxglove/ RViz
+        """
         # 1. Deadzone
         if abs(raw_pred) < STEER_DEADZONE:
             raw_pred = 0.0
@@ -121,7 +157,7 @@ class WorldModelPilot(Node):
         smoothed_pred = (SMOOTHING_FACTOR * raw_pred) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
         self.last_steering = smoothed_pred
 
-        # 3. Simple Linear Gain (Removed Exponent to reduce twitchiness)
+        # 3. Simple Linear Gain (reduce twitchiness)
         pwm_offset = smoothed_pred * MAX_TURN_OFFSET
         pwm_target = SERVO_CENTER - pwm_offset 
         pwm_target = int(max(700, min(2300, pwm_target)))
@@ -158,7 +194,16 @@ class WorldModelPilot(Node):
 
         self.publish_hud(debug_img, smoothed_pred, raw_pred)
 
+    # Visualize in Foxglove or Rviz
     def publish_hud(self, img, smooth, raw):
+        """
+        Creates a visual Heads-Up Display (HUD) overlay on an image to visualize steering commands
+
+        Args:
+            img: Image to overlay 
+            smooth: Smoothed prediction steering command
+            raw_pred: Raw Ai prediction before smoothed 
+        """
         hud = img.copy()
         h, w, _ = hud.shape
         cx = w // 2
