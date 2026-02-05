@@ -48,7 +48,7 @@ This validated that our Latent Space $z$ captured sufficient temporal and spatia
 	</video>
 </details>
 
-<summary>Dream Run Demo (Click to play/pause)</summary>
+
 https://github.com/user-attachments/assets/dbea051e-28a8-4de5-9e38-787ee6b8a432
 
 ### 4. Reasoning and Reacting to Objects (to be added) 
