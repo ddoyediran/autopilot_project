@@ -34,21 +34,6 @@ The output: The AI successfully generated a video from scratch (hallucinating th
 
 This validated that our Latent Space $z$ captured sufficient temporal and spatial information to reconstruct the car's dynamics.
 
-<details>
-	<summary>Dream Run Demo (Click to play/pause) Old</summary>
-	<video src="assets/dream_run_20260205_151545.mp4" controls width="640" height="360">
-		Your browser does not support the video tag.
-	</video>
-</details>
-
-<details>
-	<summary>Dream Run Demo (Click to play/pause)</summary>
-	<video src="https://github.com/user-attachments/assets/dbea051e-28a8-4de5-9e38-787ee6b8a432" controls width="640" height="360">
-		Your browser does not support the video tag.
-	</video>
-</details>
-
-
 https://github.com/user-attachments/assets/dbea051e-28a8-4de5-9e38-787ee6b8a432
 
 ### 4. Reasoning and Reacting to Objects (to be added) 
