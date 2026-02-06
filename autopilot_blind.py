@@ -38,12 +38,12 @@ STEER_SERVO_ID : int = 3
 SERVO_CENTER : int = 1500
 
 # 4. TUNING (Optimized)
-MAX_TURN_OFFSET : int = 1600 # High gain for sharp turns
+MAX_TURN_OFFSET : int = 1700 # High gain for sharp turns
 STEER_EXPONENT : float = 0.85 # Aggressive mid-range response
-STEER_DEADZONE : float = 0.05 # Ignore small noise
+STEER_DEADZONE : float = 0.01 # Ignore small noise
 MAX_SPEED : float = 0.22
-MIN_SPEED : float = 0.16
-BRAKE_SENSITIVITY : float = 0.6
+MIN_SPEED : float = 0.19
+BRAKE_SENSITIVITY : float = 0.2
 SMOOTHING_FACTOR : float = 0.5
 
 # 5. BLIND TRIGGER
