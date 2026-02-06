@@ -7,6 +7,11 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import time
+import csv
+import datetime
+import os
+import signal
+import sys
 
 try:
     from ai_edge_litert.interpreter import Interpreter
@@ -14,210 +19,274 @@ except ImportError:
     print("Error: 'ai-edge-litert' is not installed.")
     exit()
 
-# --- FILES ---
+# ==========================================
+#        CONFIGURATION
+# ==========================================
+# 1. MODELS
 ENCODER_PATH = 'wm_encoder_fixed.tflite'
 CONTROLLER_PATH = 'wm_controller_fixed.tflite'
 RNN_PATH = 'wm_rnn.tflite'
 
-# --- CONFIG ---
-IMG_HEIGHT = 80
-IMG_WIDTH = 160
-CROP_TOP = 40
-CROP_BOTTOM = 60
+# 2. IMAGE
+IMG_HEIGHT : int = 80
+IMG_WIDTH : int = 160
+CROP_TOP : int = 40
+CROP_BOTTOM : int = 60
 
-# Mechanics (Your Tuned Values)
-STEER_SERVO_ID = 3
-SERVO_CENTER = 1500
-MAX_TURN_OFFSET = 1600  
-STEER_EXPONENT = 0.85   
-STEER_DEADZONE = 0.05
-MAX_SPEED = 0.22       
-MIN_SPEED = 0.16       
-BRAKE_SENSITIVITY = 0.6  
-SMOOTHING_FACTOR = 0.5 
+# 3. MECHANICS
+STEER_SERVO_ID : int = 3
+SERVO_CENTER : int = 1500
 
-# --- BLIND EXPERIMENT SETTINGS ---
-BLIND_INTERVAL = 8.0  # Go blind every 8 seconds
-BLIND_DURATION = 1.0  # Stay blind for 1.0 seconds (Start small!)
+# 4. TUNING (Optimized)
+MAX_TURN_OFFSET : int = 1600 # High gain for sharp turns
+STEER_EXPONENT : float = 0.85 # Aggressive mid-range response
+STEER_DEADZONE : float = 0.05 # Ignore small noise
+MAX_SPEED : float = 0.22
+MIN_SPEED : float = 0.16
+BRAKE_SENSITIVITY : float = 0.6
+SMOOTHING_FACTOR : float = 0.5
+
+# 5. BLIND TRIGGER
+# 0 = Black, 255 = White. Below means BLIND (No Lane Visible)
+DARKNESS_THRESHOLD : float = 30.0 
 
 class BlindPilot(Node):
     def __init__(self):
         super().__init__('blind_pilot')
-        
-        # 1. Load Models
+
+        # --- 1. LOAD MODELS ---
         try:
-            # Vision
-            self.enc = Interpreter(model_path=ENCODER_PATH)
-            self.enc.allocate_tensors()
-            self.enc_in = self.enc.get_input_details()[0]['index']
-            self.enc_out = self.enc.get_output_details()[0]['index']
-            
-            # Driver
-            self.ctrl = Interpreter(model_path=CONTROLLER_PATH)
-            self.ctrl.allocate_tensors()
-            self.ctrl_in = self.ctrl.get_input_details()[0]['index']
-            self.ctrl_out = self.ctrl.get_output_details()[0]['index']
-            
-            # Memory (RNN)
+            # Vision (Encoder Model)
+            self.encoder = Interpreter(model_path=ENCODER_PATH)
+            self.encoder.allocate_tensors()
+            self.encoder_input = self.encoder.get_input_details()[0]['index']
+            self.encoder_output = self.encoder.get_output_details()[0]['index']
+
+            # Driver (Controller Model)
+            self.controller = Interpreter(model_path=CONTROLLER_PATH)
+            self.controller.allocate_tensors()
+            self.controller_input = self.controller.get_input_details()[0]['index']
+            self.controller_output = self.controller.get_output_details()[0]['index']
+
+            # Memory (RNN Model)
             self.rnn = Interpreter(model_path=RNN_PATH)
             self.rnn.allocate_tensors()
-            self.rnn_in_z = self.rnn.get_input_details()[0]['index'] # input_1 (Z)
-            self.rnn_in_a = self.rnn.get_input_details()[1]['index'] # input_2 (Action)
-            self.rnn_out = self.rnn.get_output_details()[0]['index'] # Output Z
-            
-            self.get_logger().info("ALL SYSTEMS ONLINE: Vision + Control + Memory")
+            self.rnn_input_z = self.rnn.get_input_details()[0]['index']
+            self.rnn_input_a = self.rnn.get_input_details()[1]['index']
+
+            # Fix potential index swapping for RNN inputs (Common issue in TFLite models)
+            if self.rnn.get_input_details()[0]['shape'][-1] == 1:
+                self.rnn_input_z, self.rnn_input_a = self.rnn_input_a, self.rnn_input_z
+
+            self.rnn_output = self.rnn.get_output_details()[0]['index']
+
+            self.get_logger().info("SYSTEMS ONLINE: Vision + Control + Memory")
         except Exception as err:
-            self.get_logger().error(f"Model Load Failed: {err}")
+            self.get_logger().error(f"Model Load failed: {err}")
             exit()
 
+        # --- 2. SETUP --
         self.bridge = CvBridge()
+        self.log_buffer = []
         self.start_time = time.time()
-        self.last_steering = 0.0 # For smoothing
-        self.current_z = np.zeros((1, 32), dtype=np.float32) # Keep track of state
-        
-        # ROS
+
+        # State Vectors
+        self.last_steering = 0.0
+        self.current_z = np.zeros((1, 32), dtype=np.float32)
+
+        # --- 3. ROS SUBSCRIBERS & PUBLISHERS ---
         self.sub = self.create_subscription(Image, '/ascamera/camera_publisher/rgb0/image', self.img_callback, 1)
         self.vel_pub = self.create_publisher(Twist, '/controller/cmd_vel', 10)
         self.servo_pub = self.create_publisher(SetPWMServoState, '/ros_robot_controller/pwm_servo/set_state', 10)
-        self.debug_pub = self.create_publisher(Image, '/autopilot/debug', 10)
+        self.debug_pub = self.create_publisher(Image, 'autopilot/debug', 10)
+
+        # Handle graceful shutdown on Ctrl+C
+        signal.signal(signal.SIGINT, self.signal_handler)
+
+    def signal_handler(self, sig, frame):
+        self.get_logger().info("Stopping robot...")
+        self.stop_robot()
+        self.save_logs()
+        sys.exit(0)
 
     def img_callback(self, msg):
         try:
-            # Timer logic for Blind Mode
-            now = time.time()
-            elapsed = now - self.start_time
-            cycle_time = elapsed % BLIND_INTERVAL
-            
-            # Are we blind right now?
-            is_blind = cycle_time < BLIND_DURATION
-            
+            t0 = time.perf_counter()
+
+            # 1. Get Image
+            cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+            # 2. Check Brightness (Trigger)
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            avg_brightness = np.mean(gray)
+            is_blind : bool = avg_brightness < DARKNESS_THRESHOLD
+
+            # 3. Preprocess the image (also do for debug HUD even if blind)
+            if cv_img.shape[0]> (CROP_TOP + CROP_BOTTOM):
+                crop_img = cv_img[CROP_TOP:-CROP_BOTTOM, :, :]
+            else:
+                crop_img = cv_img
+            input_img = cv2.resize(crop_img, (IMG_WIDTH, IMG_HEIGHT))
+
+            # --- Switch Logic ---
             if not is_blind:
-                # === NORMAL MODE (USE CAMERA) ===
-                cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-                
-                # Preprocess
-                if cv_img.shape[0] > (CROP_TOP + CROP_BOTTOM):
-                    crop_img = cv_img[CROP_TOP:-CROP_BOTTOM, :, :]
-                else:
-                    crop_img = cv_img
-                input_img = cv2.resize(crop_img, (IMG_WIDTH, IMG_HEIGHT))
+                # Normal Operation 'steer mode' - Process through VAE + Controller (use Camera)
                 rgb_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
                 input_data = (np.expand_dims(rgb_img, axis=0).astype(np.float32) / 255.0)
 
-                # 1. Vision -> Z
-                self.enc.set_tensor(self.enc_in, input_data)
-                self.enc.invoke()
-                # Update our global state
-                self.current_z = self.enc.get_tensor(self.enc_out) 
-                
-                debug_img = input_img # For visualization
-                
+                # Encoder Image -> z (latent vector)
+                self.encoder.set_tensor(self.encoder_input, input_data)
+                self.encoder.invoke()
+                self.current_z = self.encoder.get_tensor(self.encoder_output)
+
+                # Visuals
+                cv2.putText(input_img, f"SEEING ({int(avg_brightness)})", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             else:
-                # === BLIND MODE (USE RNN) ===
-                # We do NOT process the image. We use the 'self.current_z' from the last loop
-                # and the 'self.last_steering' we just performed.
-                
-                # RNN Inputs: [Batch, Time, Features] -> (1, 1, 32)
-                rnn_z = np.expand_dims(self.current_z, axis=1)
-                rnn_a = np.array([[[self.last_steering]]], dtype=np.float32)
-                
-                # Predict Future Z
-                self.rnn.set_tensor(self.rnn_in_z, rnn_z)
-                self.rnn.set_tensor(self.rnn_in_a, rnn_a)
+                # Blind Mode (Use RNN Memory)
+                # Ignore Image. Use previous Z + previous steering to dream next Z.
+
+                # Reshape for RNN: [1, 1, 32] and [1, 1, 1]
+                rnn_z = np.reshape(self.current_z, (1, 1, 32))
+                rnn_a = np.reshape(np.array([self.last_steering], dtype=np.float32), (1, 1, 1))
+
+                # RNN: (Z_t, A_t) -> Z_t+1
+                self.rnn.set_tensor(self.rnn_input_z, rnn_z)
+                self.rnn.set_tensor(self.rnn_input_a, rnn_a)
                 self.rnn.invoke()
-                
-                # Update global state with the dream
-                # Output shape is (1, 1, 32) -> Squeeze to (1, 32)
-                prediction_z = self.rnn.get_tensor(self.rnn_out)
+
+                # Update State from Dream
+                prediction_z = self.rnn.get_tensor(self.rnn_output)
                 self.current_z = np.reshape(prediction_z, (1, 32))
-                
-                # Create a blank/static image for debug to show we are blind
-                debug_img = np.zeros((IMG_HEIGHT, IMG_WIDTH, 3), dtype=np.uint8)
-                cv2.putText(debug_img, "BLIND", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # === CONTROL (Use Z to Steer) ===
-            # Whether Z came from Camera or RNN, the Controller doesn't care.
-            self.ctrl.set_tensor(self.ctrl_in, self.current_z)
-            self.ctrl.invoke()
-            raw_pred = self.ctrl.get_tensor(self.ctrl_out)[0][0]
+                # Visuals: Darken image and show warning
+                input_img = (input_img * 0.3).astype(np.uint8) # Darken
+                cv2.putText(input_img, f"BLIND {int(avg_brightness)}", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.putText(input_img, f"USING RNN MEMORY", (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-            # Drive
-            self.drive_robot(raw_pred, debug_img, is_blind)
+            # === C. CONTROL (Z -> Steering) ===
+            # Run Controller on whatever z we have (Real or Demand)
+            self.controller.set_tensor(self.controller_input, self.current_z)
+            self.controller.invoke()
+            raw_prediction = self.controller.get_tensor(self.controller_output)[0][0]
+
+            t1 = time.perf_counter()
+            inference_ms = (t1 - t0) * 1000
+
+            # Log and Drive
+            self.drive_robot(raw_prediction, inference_ms, input_img, is_blind)
 
         except Exception as err:
             self.get_logger().error(f"Loop Error: {err}")
 
-    def drive_robot(self, raw_pred, debug_img, is_blind):
-        # Deadzone
-        if abs(raw_pred) < STEER_DEADZONE: raw_pred = 0.0
+    
+    def drive_robot(self, raw_prediction, inference_ms, debug_img, is_blind):
+        # 1. Deadzone
+        if abs(raw_prediction) < STEER_DEADZONE:
+            raw_prediction = 0.0
 
         # Smoothing
-        smoothed_pred = (SMOOTHING_FACTOR * raw_pred) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
-        self.last_steering = smoothed_pred
+        smoothed_prediction = (SMOOTHING_FACTOR * raw_prediction) + ((1 - SMOOTHING_FACTOR) * self.last_steering)
+        self.last_steering = smoothed_prediction # Update state for next loop
 
-        # Math
-        curved_pred = np.sign(smoothed_pred) * (abs(smoothed_pred) ** STEER_EXPONENT)
-        pwm_target = int(SERVO_CENTER - (curved_pred * MAX_TURN_OFFSET))
+        # 3. Non-Linear Gain
+        curved_prediction = np.sign(smoothed_prediction) * (abs(smoothed_prediction) ** STEER_EXPONENT)
+
+        # 4. PWM Calculation 
+        pwm_offset = curved_prediction * MAX_TURN_OFFSET
+        pwm_target = int(SERVO_CENTER - pwm_offset)
         pwm_target = max(700, min(2300, pwm_target))
 
-        turn_severity = abs(curved_pred)
+        # 5. Dynamic Speed
+        turn_severity = abs(curved_prediction)
         target_speed = MAX_SPEED - (turn_severity * BRAKE_SENSITIVITY)
         target_speed = max(MIN_SPEED, target_speed)
 
-        # Actuate
+        # 6. Actuate
         servo_msg = SetPWMServoState()
         servo_msg.duration = 0.05
         state_part = PWMServoState()
-        state_part.id = [STEER_SERVO_ID] 
+        state_part.id = [STEER_SERVO_ID]
         state_part.position = [pwm_target]
         state_part.offset = [0]
-        servo_msg.state = [state_part] 
+        servo_msg.state = [state_part]
         self.servo_pub.publish(servo_msg)
 
         twist = Twist()
         twist.linear.x = float(target_speed)
         self.vel_pub.publish(twist)
 
-        # Debug HUD
-        self.publish_hud(debug_img, smoothed_pred, is_blind)
+        # 7. Log To RAM
+        elapsed = time.time() - self.start_time
+        mode_flag = 1 if is_blind else 0
+
+        self.log_buffer.append([
+            f"{elapsed:.3f}",
+            f"{inference_ms:.1f}",
+            mode_flag,
+            f"{raw_prediction:.3f}",
+            f"{smoothed_prediction:.3f}",
+            f"{pwm_target}",
+            f"{target_speed:.2f}"
+        ])
+
+        # 8. Publish Debug Image HUD
+        self.publish_hud(debug_img, smoothed_prediction, is_blind)
 
     def publish_hud(self, img, pred, is_blind):
         hud = img.copy()
         h, w, _ = hud.shape
         cx = w // 2
         
+        # Color: Green if Seeing, Red if Blind
         color = (0, 0, 255) if is_blind else (0, 255, 0)
         
         cv2.line(hud, (cx, h), (cx, h-20), (255, 255, 255), 1)
         pred_x = int(cx + (pred * (w/2)))
-        cv2.line(hud, (cx, h), (pred_x, h-20), color, 2)
+        cv2.line(hud, (cx, h), (pred_x, h-20), color, 3)
         
         msg = self.bridge.cv2_to_imgmsg(hud, encoding="bgr8")
         self.debug_pub.publish(msg)
 
+    def stop_robot(self):
+        stop = Twist()
+        self.vel_pub.publish(stop)
+        servo_msg = SetPWMServoState()
+        servo_msg.duration = 0.5
+        state_part = PWMServoState()
+        state_part.id = [STEER_SERVO_ID]
+        state_part.position = [SERVO_CENTER]
+        state_part.offset = [0]
+        servo_msg.state = [state_part]
+        self.servo_pub.publish(servo_msg)
+
+    def save_logs(self):
+        if not self.log_buffer:
+            print("No logs to save.")
+            return
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"blind_pilot_log_{timestamp}.csv"
+
+        print(f"\n--- SAVING FLIGHT RECORDER: {filename} ---")
+        try:
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Time", "Inference_ms", "Is_Blind", "Raw_AI", "Smoothed", "PWM", "Speed"])
+                writer.writerows(self.log_buffer)
+            print("Logs Saved.")
+        except Exception as err:
+            print(f"Log Save Error: {err}")
+
 def main(args=None):
     rclpy.init(args=args)
     node = BlindPilot()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    finally:
-        if rclpy.ok():
-            stop = Twist()
-            node.vel_pub.publish(stop)
-            
-            servo_msg = SetPWMServoState()
-            servo_msg.duration = 0.5
-            state_part = PWMServoState()
-            state_part.id = [STEER_SERVO_ID]
-            state_part.position = [SERVO_CENTER]
-            state_part.offset = [0]
-            servo_msg.state = [state_part]
-            node.servo_pub.publish(servo_msg)
-            
-            node.destroy_node()
-            rclpy.shutdown()
+    # The signal_handler will handle the cleanup/logging
+
 
 if __name__ == '__main__':
     main()
