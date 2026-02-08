@@ -69,23 +69,18 @@ class ActiveInferencePilot(Node):
             self.rnn_interp.allocate_tensors()
             self.rnn_out = self.rnn_interp.get_output_details()[0]['index']
             
-            # --- FIX: DYNAMIC INPUT DETECTION ---
-            # We check the shapes to find which input is Z (32) and which is Action (1)
+            # DYNAMIC INPUT DETECTION
             rnn_inputs = self.rnn_interp.get_input_details()
             self.rnn_in_z = None
             self.rnn_in_a = None
             
             for i, inp in enumerate(rnn_inputs):
                 shape = inp['shape']
-                # Shape is likely [1, 1, 32] or [1, 1, 1]
                 last_dim = shape[-1]
-                
                 if last_dim == 32:
                     self.rnn_in_z = inp['index']
-                    self.get_logger().info(f"RNN Input Z found at index {inp['index']}")
                 elif last_dim == 1:
                     self.rnn_in_a = inp['index']
-                    self.get_logger().info(f"RNN Input Action found at index {inp['index']}")
             
             if self.rnn_in_z is None or self.rnn_in_a is None:
                 self.get_logger().error("Failed to identify RNN inputs by shape!")
@@ -141,7 +136,6 @@ class ActiveInferencePilot(Node):
             z_pred = self.rnn_interp.get_tensor(self.rnn_out)
             
             # --- C. SURPRISE CALCULATION ---
-            # MSE between Expectation and Reality
             z_pred_flat = z_pred.flatten()
             z_obs_flat = z_obs.flatten()
             error = np.mean((z_obs_flat - z_pred_flat) ** 2)
@@ -173,32 +167,22 @@ class ActiveInferencePilot(Node):
         pwm_target = max(700, min(2300, pwm_target))
 
         # --- 2. SOCIAL NUDGE LOGIC ---
-        
-        # Calculate Base Speed (Slow down for turns)
         base_speed = MAX_SPEED - (abs(curved_pred) * BRAKE_SENSITIVITY)
         
-        # Determine Status based on Surprise
         if surprise > (SURPRISE_THRESHOLD * 2.0):
-            # LEVEL 3: PANIC / EMERGENCY STOP
             target_speed = 0.0 
             status = "EMERGENCY STOP"
-            color = (0, 0, 255) # Red
-            
+            color = (0, 0, 255) 
         elif surprise > SURPRISE_THRESHOLD:
-            # LEVEL 2: SOCIAL NUDGE
             target_speed = CREEP_SPEED
             status = "NUDGING"
-            color = (0, 255, 255) # Yellow/Cyan
-            
+            color = (0, 255, 255) 
         else:
-            # LEVEL 1: NORMAL DRIVING
             target_speed = max(MIN_SPEED, base_speed)
             status = "NORMAL"
-            color = (0, 255, 0) # Green
+            color = (0, 255, 0)
 
         # --- 3. ACTUATE ---
-        
-        # Steering
         servo_msg = SetPWMServoState()
         servo_msg.duration = 0.05
         state_part = PWMServoState()
@@ -208,7 +192,6 @@ class ActiveInferencePilot(Node):
         servo_msg.state = [state_part] 
         self.servo_pub.publish(servo_msg)
 
-        # Motor
         twist = Twist()
         twist.linear.x = float(target_speed)
         self.vel_pub.publish(twist)
@@ -220,18 +203,11 @@ class ActiveInferencePilot(Node):
 
     def publish_hud(self, img, surprise, status, color):
         hud = img.copy()
-        
-        # Surprise Bar
-        bar_len = int(surprise * 1500) # Scale for visibility
+        bar_len = int(surprise * 1500) 
         bar_len = min(160, bar_len)
-        
-        # Draw Status Text
         cv2.putText(hud, status, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        
-        # Draw Bar
         cv2.rectangle(hud, (0, 70), (bar_len, 80), color, -1)
         cv2.putText(hud, f"Err: {surprise:.3f}", (5, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255,255,255))
-
         msg = self.bridge.cv2_to_imgmsg(hud, encoding="bgr8")
         self.debug_pub.publish(msg)
 
@@ -239,27 +215,56 @@ class ActiveInferencePilot(Node):
         if not self.log_buffer: return
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"surprise_log_{timestamp}.csv"
-        print(f"Saving Research Data: {filename}")
+        print(f"\nSaving Research Data: {filename}")
         try:
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Time", "Surprise_MSE", "Steering", "Speed"])
                 writer.writerows(self.log_buffer)
+            print("Logs Saved.")
         except Exception as e:
-            print(e)
+            print(f"Failed to save logs: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = ActiveInferencePilot()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        print("\n!!! EMERGENCY STOP TRIGGERED !!!")
+        # 1. STOP MOTORS IMMEDIATELY (Before saving logs)
+        stop = Twist()
+        stop.linear.x = 0.0
+        stop.angular.z = 0.0
+        node.vel_pub.publish(stop)
+        
+        # 2. CENTER STEERING
+        servo_msg = SetPWMServoState()
+        servo_msg.duration = 0.1
+        state_part = PWMServoState()
+        state_part.id = [STEER_SERVO_ID]
+        state_part.position = [SERVO_CENTER]
+        state_part.offset = [0]
+        servo_msg.state = [state_part]
+        node.servo_pub.publish(servo_msg)
+        
+        # Small sleep to ensure message goes out before ROS dies
+        time.sleep(0.1) 
+        
+    except Exception as e:
+        print(f"\nError: {e}")
+        
     finally:
-        node.vel_pub.publish(Twist()) # Stop
+        # 3. SAVE LOGS (Now that robot is stopped)
         node.save_logs()
+        
+        # 4. CLEANUP
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+            
+    print("System Shutdown Complete.")
 
 if __name__ == '__main__':
     main()
