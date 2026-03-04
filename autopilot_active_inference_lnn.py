@@ -24,9 +24,9 @@ except ImportError:
 # ==========================================
 #        RESEARCH CONFIGURATION
 # ==========================================
-ENCODER_PATH = 'models/wm_encoder_fixed.tflite'
-CONTROLLER_PATH = 'models/wm_controller_fixed.tflite'
-RNN_PATH = 'models/wm_lnn.tflite'  # The new Liquid World Model!
+ENCODER_PATH = 'wm_encoder_fixed.tflite'
+CONTROLLER_PATH = 'wm_controller_fixed.tflite'
+RNN_PATH = 'wm_lnn.tflite'  # The new Liquid World Model!
 
 # Image
 IMG_HEIGHT = 80
