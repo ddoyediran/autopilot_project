@@ -26,30 +26,31 @@ except ImportError:
 # ==========================================
 ENCODER_PATH = 'wm_encoder_fixed.tflite'
 CONTROLLER_PATH = 'wm_controller_fixed.tflite'
-RNN_PATH = 'wm_lnn.tflite'  # The new Liquid World Model!
+RNN_PATH = 'wm_lnn.tflite'  
 
 # Image
 IMG_HEIGHT = 80
 IMG_WIDTH = 160
 CROP_TOP = 40
 CROP_BOTTOM = 60
-HIDDEN_UNITS = 64 # Matches your LNN config
+HIDDEN_UNITS = 64 
 
 # Mechanics
 STEER_SERVO_ID = 3
 SERVO_CENTER = 1500
-MAX_TURN_OFFSET = 1350
-STEER_EXPONENT = 1.1
+MAX_TURN_OFFSET = 800  # Safe max offset (700 to 2300)
+
+# --- NEW TUNING PARAMS ---
+STEER_GAIN = 3.0       # Boosts the LNN's -0.3 prediction to -0.9!
+SMOOTHING_FACTOR = 0.8 # 80% new, 20% old (Trust the LNN's internal memory more)
 
 # Speed & Safety
 MAX_SPEED = 0.22        
 MIN_SPEED = 0.15        
 CREEP_SPEED = 0.12      
 BRAKE_SENSITIVITY = 0.5
-SMOOTHING_FACTOR = 0.6
 
-# --- ACTIVE INFERENCE SETTINGS ---
-# Baseline MSE is ~0.004, so 0.05 represents a massive visual anomaly!
+# Active Inference Settings
 SURPRISE_THRESHOLD = 0.05 
 
 class ActiveInferencePilot(Node):
@@ -73,14 +74,12 @@ class ActiveInferencePilot(Node):
             self.rnn_interp = Interpreter(model_path=RNN_PATH)
             self.rnn_interp.allocate_tensors()
             
-            # FOOLPROOF SHAPE-BASED INPUT MAPPING
             for inp in self.rnn_interp.get_input_details():
                 last_dim = inp['shape'][-1]
                 if last_dim == 32: self.rnn_in_z = inp['index']
                 elif last_dim == 1: self.rnn_in_a = inp['index']
                 elif last_dim == HIDDEN_UNITS: self.rnn_in_hx = inp['index']
                 
-            # FOOLPROOF SHAPE-BASED OUTPUT MAPPING
             for out in self.rnn_interp.get_output_details():
                 last_dim = out['shape'][-1]
                 if last_dim == 32: self.rnn_out_z = out['index']
@@ -99,7 +98,7 @@ class ActiveInferencePilot(Node):
         self.start_time = time.time()
         self.last_steering = 0.0
         
-        # Theory of Mind Variables (Including explicit LNN Memory!)
+        # Theory of Mind Variables
         self.hx_state = np.zeros((1, HIDDEN_UNITS), dtype=np.float32)
         self.prev_z = np.zeros((1, 32), dtype=np.float32)
         self.prev_action = 0.0
@@ -107,12 +106,15 @@ class ActiveInferencePilot(Node):
 
         # ROS
         self.sub = self.create_subscription(Image, '/ascamera/camera_publisher/rgb0/image', self.img_callback, 1)
-        self.vel_pub = self.create_publisher(Twist, '/controller/cmd_vel', 10)
-        self.servo_pub = self.create_publisher(SetPWMServoState, '/ros_robot_controller/pwm_servo/set_state', 10)
-        self.debug_pub = self.create_publisher(Image, '/autopilot/debug', 10)
+        self.vel_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1)
+        self.servo_pub = self.create_publisher(SetPWMServoState, '/ros_robot_controller/pwm_servo/set_state', 1)
+        self.debug_pub = self.create_publisher(Image, '/autopilot/debug', 1)
 
     def img_callback(self, msg):
         if not self.is_running: return
+        
+        inf_start = time.perf_counter() # <--- START INFERENCE TIMER
+        
         try:
             # --- A. PERCEPTION ---
             cv_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -134,47 +136,56 @@ class ActiveInferencePilot(Node):
             
             self.rnn_interp.set_tensor(self.rnn_in_z, rnn_input_z)
             self.rnn_interp.set_tensor(self.rnn_in_a, rnn_input_a)
-            self.rnn_interp.set_tensor(self.rnn_in_hx, self.hx_state) # Pass explicit memory
+            self.rnn_interp.set_tensor(self.rnn_in_hx, self.hx_state)
             self.rnn_interp.invoke()
             
             z_pred = self.rnn_interp.get_tensor(self.rnn_out_z)
-            self.hx_state = self.rnn_interp.get_tensor(self.rnn_out_hx) # Update explicit memory
+            self.hx_state = self.rnn_interp.get_tensor(self.rnn_out_hx) 
             
             # --- C. SURPRISE CALCULATION ---
-            self.surprise_metric = np.mean((z_obs.flatten() - z_pred.flatten()) ** 2)
+            self.surprise_metric = float(np.mean((z_obs.flatten() - z_pred.flatten()) ** 2))
 
             # --- D. ACTION SELECTION ---
             self.ctrl_interp.set_tensor(self.ctrl_in, z_obs)
             self.ctrl_interp.invoke()
-            raw_pred = self.ctrl_interp.get_tensor(self.ctrl_out)[0][0]
+            raw_pred = float(self.ctrl_interp.get_tensor(self.ctrl_out)[0][0])
 
             # --- E. UPDATE PREVIOUS STATES ---
             self.prev_z = z_obs
             self.prev_action = raw_pred
+            
+            inf_end = time.perf_counter() # <--- END INFERENCE TIMER
+            inference_ms = (inf_end - inf_start) * 1000.0
 
             # --- F. DRIVE ---
-            self.drive_robot(raw_pred, self.surprise_metric, input_img)
+            self.drive_robot(raw_pred, self.surprise_metric, input_img, inference_ms)
 
         except Exception as e:
             self.get_logger().error(f"Loop Error: {e}")
 
-    def drive_robot(self, raw_pred, surprise, debug_img):
-        # 1. Standard Steering Logic
-        smoothed_pred = (SMOOTHING_FACTOR * raw_pred) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
+    def drive_robot(self, raw_pred, surprise, debug_img, inference_ms):
+        # 1. Amplified Steering Logic
+        boosted_pred = raw_pred * STEER_GAIN
+        steer_clamped = max(-1.0, min(1.0, boosted_pred))
+        
+        # Less smoothing so it reacts faster to the curve exit!
+        smoothed_pred = (SMOOTHING_FACTOR * steer_clamped) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
         self.last_steering = smoothed_pred
         
-        curved_pred = np.sign(smoothed_pred) * (abs(smoothed_pred) ** STEER_EXPONENT)
-        pwm_target = int(SERVO_CENTER - (curved_pred * MAX_TURN_OFFSET))
+        pwm_target = int(SERVO_CENTER - (smoothed_pred * MAX_TURN_OFFSET))
         pwm_target = max(700, min(2300, pwm_target))
 
         # --- 2. SOCIAL NUDGE LOGIC ---
-        base_speed = MAX_SPEED - (abs(curved_pred) * BRAKE_SENSITIVITY)
+        base_speed = MAX_SPEED - (abs(smoothed_pred) * BRAKE_SENSITIVITY)
         
-        if surprise > (SURPRISE_THRESHOLD * 2.0):
+        # Don't panic trigger surprise in the first 2 seconds while the memory warms up!
+        elapsed = time.time() - self.start_time
+        
+        if elapsed > 2.0 and surprise > (SURPRISE_THRESHOLD * 2.0):
             target_speed = 0.0 
             status = "EMERGENCY STOP"
             color = (0, 0, 255) 
-        elif surprise > SURPRISE_THRESHOLD:
+        elif elapsed > 2.0 and surprise > SURPRISE_THRESHOLD:
             target_speed = CREEP_SPEED
             status = "NUDGING"
             color = (0, 255, 255) 
@@ -187,9 +198,9 @@ class ActiveInferencePilot(Node):
         servo_msg = SetPWMServoState()
         servo_msg.duration = 0.05
         state_part = PWMServoState()
-        state_part.id =[STEER_SERVO_ID] 
+        state_part.id = [STEER_SERVO_ID] 
         state_part.position = [pwm_target]
-        state_part.offset =[0]
+        state_part.offset = [0]
         servo_msg.state = [state_part] 
         self.servo_pub.publish(servo_msg)
 
@@ -198,16 +209,15 @@ class ActiveInferencePilot(Node):
         self.vel_pub.publish(twist)
 
         # --- 4. LOG & DEBUG ---
-        elapsed = time.time() - self.start_time
-        self.log_buffer.append([f"{elapsed:.3f}", f"{surprise:.5f}", f"{raw_pred:.3f}", f"{target_speed:.2f}"])
-        self.publish_hud(debug_img, surprise, status, color)
+        self.log_buffer.append([f"{elapsed:.3f}", f"{surprise:.5f}", f"{raw_pred:.3f}", f"{target_speed:.2f}", f"{inference_ms:.1f}"])
+        self.publish_hud(debug_img, surprise, status, color, inference_ms)
 
-    def publish_hud(self, img, surprise, status, color):
+    def publish_hud(self, img, surprise, status, color, inference_ms):
         hud = img.copy()
         bar_len = int(min(160, surprise * 1500))
         cv2.putText(hud, status, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         cv2.rectangle(hud, (0, 70), (bar_len, 80), color, -1)
-        cv2.putText(hud, f"Err: {surprise:.4f}", (5, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255,255,255))
+        cv2.putText(hud, f"Err: {surprise:.4f} | {inference_ms:.1f}ms", (5, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255,255,255))
         msg = self.bridge.cv2_to_imgmsg(hud, encoding="rgb8")
         self.debug_pub.publish(msg)
 
@@ -219,7 +229,7 @@ class ActiveInferencePilot(Node):
         try:
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Time", "Surprise_MSE", "Steering", "Speed"])
+                writer.writerow(["Time", "Surprise_MSE", "Steering", "Speed", "Inference_ms"])
                 writer.writerows(self.log_buffer)
             print("Logs Saved.")
         except Exception as e:
@@ -236,13 +246,11 @@ def main(args=None):
         
         try:
             for _ in range(3):
-                # STOP MOTORS
                 stop = Twist()
                 stop.linear.x = 0.0
                 stop.angular.z = 0.0
                 node.vel_pub.publish(stop)
                 
-                # CENTER STEERING
                 servo_msg = SetPWMServoState()
                 servo_msg.duration = 0.1
                 state_part = PWMServoState()
