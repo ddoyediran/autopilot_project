@@ -38,17 +38,16 @@ HIDDEN_UNITS = 64
 # Mechanics
 STEER_SERVO_ID = 3
 SERVO_CENTER = 1500
-MAX_TURN_OFFSET = 800  # Safe max offset (700 to 2300)
 
-# --- NEW TUNING PARAMS ---
-STEER_GAIN = 3.0       # Boosts the LNN's -0.3 prediction to -0.9!
-SMOOTHING_FACTOR = 0.8 # 80% new, 20% old (Trust the LNN's internal memory more)
+MAX_TURN_OFFSET = 1350 
+STEER_EXPONENT = 1.1 # Soft on straights, aggressive in curves
+SMOOTHING_FACTOR = 0.6 # 60 percent new, 40 percent old (Smooths perfectly without lag) 
 
 # Speed & Safety
 MAX_SPEED = 0.22        
-MIN_SPEED = 0.15        
+MIN_SPEED = 0.16        # Increased from 0.14 so it doesn't stall exiting corners!
 CREEP_SPEED = 0.12      
-BRAKE_SENSITIVITY = 0.5
+BRAKE_SENSITIVITY = 0.5 # 0.4 # Less aggressive braking
 
 # Active Inference Settings
 SURPRISE_THRESHOLD = 0.05 
@@ -164,23 +163,25 @@ class ActiveInferencePilot(Node):
             self.get_logger().error(f"Loop Error: {e}")
 
     def drive_robot(self, raw_pred, surprise, debug_img, inference_ms):
-        # 1. Amplified Steering Logic
-        boosted_pred = raw_pred * STEER_GAIN
-        steer_clamped = max(-1.0, min(1.0, boosted_pred))
-        
-        # Less smoothing so it reacts faster to the curve exit!
-        smoothed_pred = (SMOOTHING_FACTOR * steer_clamped) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
+        # --- 1. PHYSICAL CALIBRATION ---
+        # Single Exponential smoothing
+        smoothed_pred = (SMOOTHING_FACTOR * raw_pred) + ((1.0 - SMOOTHING_FACTOR) * self.last_steering)
         self.last_steering = smoothed_pred
         
-        pwm_target = int(SERVO_CENTER - (smoothed_pred * MAX_TURN_OFFSET))
+        # Exponential curve: ignores tiny straightaway noise naturally, boosts sharp curves
+        curved_pred = np.sign(smoothed_pred) * (abs(smoothed_pred) ** STEER_EXPONENT)
+        pwm_offset = curved_pred * MAX_TURN_OFFSET
+        pwm_target = int(SERVO_CENTER - pwm_offset)
+        
+        # Physical hardware limits clamp (Protects the servo gears)
         pwm_target = max(700, min(2300, pwm_target))
 
-        # --- 2. SOCIAL NUDGE LOGIC ---
-        base_speed = MAX_SPEED - (abs(smoothed_pred) * BRAKE_SENSITIVITY)
+        # --- 2. DYNAMIC BRAKING ---
+        base_speed = MAX_SPEED - (abs(curved_pred) * BRAKE_SENSITIVITY)
         
-        # Don't panic trigger surprise in the first 2 seconds while the memory warms up!
         elapsed = time.time() - self.start_time
         
+        # Give the Liquid Memory 2 seconds to warm up before enabling Surprise braking
         if elapsed > 2.0 and surprise > (SURPRISE_THRESHOLD * 2.0):
             target_speed = 0.0 
             status = "EMERGENCY STOP"
@@ -199,16 +200,16 @@ class ActiveInferencePilot(Node):
         servo_msg.duration = 0.05
         state_part = PWMServoState()
         state_part.id = [STEER_SERVO_ID] 
-        state_part.position = [pwm_target]
+        state_part.position =[pwm_target]
         state_part.offset = [0]
-        servo_msg.state = [state_part] 
+        servo_msg.state =[state_part] 
         self.servo_pub.publish(servo_msg)
 
         twist = Twist()
         twist.linear.x = float(target_speed)
         self.vel_pub.publish(twist)
 
-        # --- 4. LOG & DEBUG ---
+        # --- 4. LOGGING ---
         self.log_buffer.append([f"{elapsed:.3f}", f"{surprise:.5f}", f"{raw_pred:.3f}", f"{target_speed:.2f}", f"{inference_ms:.1f}"])
         self.publish_hud(debug_img, surprise, status, color, inference_ms)
 
